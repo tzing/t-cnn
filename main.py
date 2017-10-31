@@ -7,6 +7,14 @@ from torch.autograd import Variable
 import torchvision
 import torchvision.transforms as transforms
 
+import argparse
+import os
+from collections import deque
+from time import time
+
+import numpy
+from PIL import ImageDraw
+
 from data import Folder
 from sample import SimpleSampler
 from model import Net
@@ -14,12 +22,37 @@ from bbreg import BBRegressor
 
 
 """
+Arg Parse
+"""
+if __name__ != '__main__':
+    exit(1)
+
+psr = argparse.ArgumentParser()
+psr.add_argument('dataset')
+psr.add_argument('dest')
+
+args = psr.parse_args()
+dataset_folder = args.dataset
+output_dest = args.dest
+
+# ensure dir exist
+output_dest = os.path.abspath(os.path.expanduser(output_dest))
+if not os.path.exists(output_dest):
+    os.makedirs(output_dest)
+elif not os.path.isdir(output_dest):
+    print('Not a directory: {output_dest}')
+    exit(2)
+
+
+"""
 Constants
 """
-FOLDER      = '~/Dataset/vot/bag'
 CORP_SIZE   = 75
 
 FEATURE_ARCH    = 'vgg11_bn'
+
+SAMPLING_SIGMA_XY   = .3
+SAMPLING_SIGMA_S    = .5
 
 FINETUNE_POS_NUM    = 50
 FINETUNE_NEG_NUM    = 200
@@ -32,6 +65,7 @@ FINETUNE_LR         = 3E-3
 FINETUNE_MOMENTUM   = .9
 FINETUNE_WDECAY     = 5E-4
 
+MAX_NODE_NUM    = 10
 BLOCK_FRAME     = 10
 
 NUM_PREDICT_PATCH   = 256
@@ -43,7 +77,7 @@ Data loading
 """
 print('==> loading data')
 
-folder = Folder(FOLDER)
+folder = Folder(dataset_folder)
 print(f'Done. got {len(folder)} frames')
 
 folder = iter(folder)
@@ -83,15 +117,22 @@ train_sampler = SimpleSampler(
     target_transforms_pos=lambda x: 0,
     target_transforms_neg=lambda x: 1,
     num=[FINETUNE_POS_NUM, FINETUNE_NEG_NUM],
-    threshold=FINETUNE_IOU_THRESHOLD
+    threshold=FINETUNE_IOU_THRESHOLD,
+    sigma_xy=[SAMPLING_SIGMA_XY, SAMPLING_SIGMA_XY],
+    sigma_s=SAMPLING_SIGMA_S
 )
 
 test_sampler = SimpleSampler(
     train_bbox,
     img_transforms,
     num=[NUM_PREDICT_PATCH, 0],
-    threshold=[0, 1]
+    threshold=[0, 1],
+    sigma_xy=[SAMPLING_SIGMA_XY, SAMPLING_SIGMA_XY],
+    sigma_s=SAMPLING_SIGMA_S
 )
+
+# nodes
+nodes = deque(maxlen=MAX_NODE_NUM)
 
 
 """
@@ -100,41 +141,67 @@ training
 # finetune on initial frame
 print('==> initial finetune')
 
-def finetune(regions, epoch=FINETUNE_EPOCH, lr=FINETUNE_LR):
-    dataset = data.ConcatDataset(regions)
-    loader = data.DataLoader(dataset, FINETUNE_POS_NUM+FINETUNE_NEG_NUM)
+class Node(object):
+    """
+    Represent `the CNN` node in the paper
+    """
 
-    net = Net().cuda()
-    criterion = nn.CrossEntropyLoss().cuda()
-    optimizer = torch.optim.SGD(
-        net.parameters(),
-        lr=lr,
-        momentum=FINETUNE_MOMENTUM,
-        weight_decay=FINETUNE_WDECAY
-    )
+    def __init__(self, regions, epoch=FINETUNE_EPOCH, lr=FINETUNE_LR):
+        """
+        Perform finetune
+        """
+        dataset = data.ConcatDataset(regions)
+        loader = data.DataLoader(dataset, FINETUNE_POS_NUM+FINETUNE_NEG_NUM)
 
-    for ep in range(epoch):
-        for imgs, labels in loader:
-            imgs = Variable(imgs).cuda()
-            labels = Variable(labels).cuda()
-
-            imgs = featNet(imgs)
-
-            optimizer.zero_grad()
-            output = net(imgs)
-            loss = criterion(output, labels)
-            loss.backward()
-            optimizer.step()
-
-        print(
-            f'Epoch[{ep+1}/{epoch}]',
-            f'loss={loss.data[0]:.4f}',
-            sep='\t'
+        net = Net().cuda()
+        criterion = nn.CrossEntropyLoss().cuda()
+        optimizer = torch.optim.SGD(
+            net.parameters(),
+            lr=lr,
+            momentum=FINETUNE_MOMENTUM,
+            weight_decay=FINETUNE_WDECAY
         )
 
-    return net
+        tic_train = time()
+        for ep in range(epoch):
+            tic_epoch = time()
+            for imgs, labels in loader:
+                imgs = Variable(imgs).cuda()
+                labels = Variable(labels).cuda()
 
-net = finetune([train_sampler(train_img, train_bbox)], INIT_EPOCH, INIT_LR)
+                imgs = featNet(imgs)
+
+                optimizer.zero_grad()
+                output = net(imgs)
+                loss = criterion(output, labels)
+                loss.backward()
+                optimizer.step()
+
+            print(
+                f'Epoch[{ep+1}/{epoch}]',
+                f'loss={loss.data[0]:.4f}',
+                f'time={time()-tic_epoch:.03}s',
+                sep='\t'
+            )
+
+        print(f'Training finish. Elasped time is {time()-tic_train:.3}sec')
+        net.train(False)
+
+        self.net = net
+        self.confidence = 1
+
+    def __call__(self, feat):
+        """
+        Bounding box predicting
+        """
+        x = self.net(feat)
+        x = nn.functional.softmax(x, 1)
+
+        scores, idx = x[:, 0].topk(NUM_PREDICT_USE)
+        return scores, idx
+
+node = Node([train_sampler(train_img, train_bbox)], INIT_EPOCH, INIT_LR)
+nodes.append(node)
 
 # train bb regression
 print('==> bb regression')
@@ -167,7 +234,6 @@ recent_scores = []
 recent_regions = []
 
 last_bbox = train_bbox
-net.train(False)
 
 for frame_idx, (frame_img, _) in enumerate(folder):
     print(f'Frame[{frame_idx}]')
@@ -178,18 +244,35 @@ for frame_idx, (frame_img, _) in enumerate(folder):
     # first attempt
     imgs, boxs = next(iter(loader))
 
-    x = Variable(imgs).cuda()
-    x = featNet(x)
-    x = net(x)
+    feat = Variable(imgs).cuda()
+    feat = featNet(feat)
 
-    x = nn.functional.softmax(x, 1)
+    # predict use all candidates
+    weight = torch.FloatTensor(len(nodes))
+    scores = torch.FloatTensor(len(nodes), NUM_PREDICT_USE)
+    indices = torch.LongTensor(len(nodes), NUM_PREDICT_USE)
 
-    score, idx = x[:, 0].topk(NUM_PREDICT_USE)
+    for i, node in enumerate(nodes):
+        score, idxs = node(feat)
+        weight[i] = node.confidence
+        scores[i] = score.data
+        indices[i] = idxs.data
 
-    score = torch.mean(score.data)
-    idx = idx.data.cpu()
+    # modify weight ...see eq(6)
+    weight /= torch.sum(weight)
+    for i, w in enumerate(weight):
+        scores[i] *= w
 
-    predict = torch.mean(boxs[idx, :], 0).numpy()
+    # flatten
+    scores = scores.view(-1)
+    indices = indices.view(-1)
+
+    # select sample with max modified score
+    conf, idx = scores.topk(NUM_PREDICT_USE)
+
+    # make predict
+    predict = torch.mean(boxs[indices[idx], :], 0).numpy()
+    confidence = torch.mean(conf)
 
     # bb regression
     img = frame_img.crop(tuple(predict))
@@ -202,13 +285,23 @@ for frame_idx, (frame_img, _) in enumerate(folder):
     predict = bbreg.predict(img, predict)
     predict = predict.flatten()
 
-    # print
-    print(predict, f'conf={score:.4f}')
+    # draw
+    out_img = frame_img.copy()
+
+    draw = ImageDraw.Draw(out_img)
+    draw.rectangle(tuple(predict), outline='red')
+    del draw
+
+    # output
+    print(predict, f'conf={confidence:.4f}')
+
+    fn = os.path.join(output_dest, f'{frame_idx:06}.jpg')
+    out_img.save(fn)
 
     # save
     last_bbox = predict
 
-    recent_scores.append(score)
+    recent_scores.append(confidence)
     recent_regions.append(train_sampler(frame_img, predict))
 
     # continue predicting
@@ -217,5 +310,14 @@ for frame_idx, (frame_img, _) in enumerate(folder):
 
     # train new model
     print('>> train new finetune model')
-    net = finetune(recent_regions)
-    break
+    node = Node(recent_regions)
+
+    beta_conf = numpy.mean(recent_scores)
+    all_confs = [n.confidence for n in nodes]
+    all_confs = numpy.minimum(all_confs, beta_conf)
+
+    node.confidence = numpy.max(all_confs)
+    nodes.append(node)
+
+    recent_scores = []
+    recent_regions = []
