@@ -15,8 +15,7 @@ from time import time
 import numpy
 from PIL import ImageDraw
 
-from data import Folder
-from sample import SimpleSampler
+from data import Folder, SimpleSampler
 from model import Net
 from bbreg import BBRegressor
 
