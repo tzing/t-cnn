@@ -70,6 +70,7 @@ BLOCK_FRAME     = 10
 NUM_PREDICT_PATCH   = 256
 NUM_PREDICT_USE     = 5
 
+OUTPUT_FILENAME_FMT = '%06d.jpg'
 
 """
 Data loading
@@ -202,6 +203,12 @@ class Node(object):
 node = Node([train_sampler(train_img, train_bbox)], INIT_EPOCH, INIT_LR)
 nodes.append(node)
 
+out_img = train_img.copy()
+draw = ImageDraw.Draw(out_img)
+draw.rectangle(tuple(train_bbox), outline='white')
+del draw
+out_img.save(os.path.join(output_dest, OUTPUT_FILENAME_FMT %0))
+
 # train bb regression
 print('==> bb regression')
 
@@ -234,8 +241,8 @@ recent_regions = []
 
 last_bbox = train_bbox
 
-for frame_idx, (frame_img, _) in enumerate(folder):
-    print(f'Frame[{frame_idx}]')
+for frame_idx, (frame_img, _) in enumerate(folder, 1):
+    print(f'Frame[{frame_idx}]', end='\t')
 
     dataset = test_sampler(frame_img, last_bbox)
     loader = data.DataLoader(dataset, len(dataset))
@@ -294,7 +301,7 @@ for frame_idx, (frame_img, _) in enumerate(folder):
     # output
     print(predict, f'conf={confidence:.4f}')
 
-    fn = os.path.join(output_dest, f'{frame_idx:06}.jpg')
+    fn = os.path.join(output_dest, OUTPUT_FILENAME_FMT %frame_idx)
     out_img.save(fn)
 
     # save
